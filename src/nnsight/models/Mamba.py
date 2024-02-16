@@ -12,6 +12,7 @@ from mamba_ssm import MambaLMHeadModel
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.utils.hf import load_config_hf, load_state_dict_hf
 from transformers import AutoTokenizer, BatchEncoding, PreTrainedModel
+from functools import partial
 
 from nnsight.util import WrapperModule
 
@@ -123,12 +124,18 @@ class SSM(torch.nn.Module):
 
             return y
 
-    def __init__(self):
+    def __init__(self, max_seq_length = None):
         super().__init__()
+        self.max_seq_length = max_seq_length
 
         self.discA = SSM.DiscA()
         self.discB = SSM.DiscB()
-        self.hx = SSM.Hx()
+        if max_seq_length is not None:
+          self.hx = torch.nn.ModuleList(
+            [SSM.Hx() for _ in range(max_seq_length)] #max seq length
+          )
+        else:
+          self.hx = SSM.Hx()
         self.yh = SSM.Yh()
 
     def forward(self, x, delta, A, B, C, D=None, z=None, return_last_state=False):
@@ -162,16 +169,21 @@ class SSM(torch.nn.Module):
 
         # Main recurrence loop
         for token_idx in range(x.shape[2]):
+          if self.max_seq_length is not None:
+            h = self.hx[token_idx](
+                deltaA[:, :, token_idx], deltaB[:, :, token_idx], x[:, :, token_idx], h
+            )
+          else:
             h = self.hx(
                 deltaA[:, :, token_idx], deltaB[:, :, token_idx], x[:, :, token_idx], h
             )
 
-            y = self.yh(h, C[:, :, token_idx])
+          y = self.yh(h, C[:, :, token_idx])
 
-            if token_idx == x.shape[2] - 1:
-                last_state = h
+          if token_idx == x.shape[2] - 1:
+              last_state = h
 
-            ys.append(y)
+          ys.append(y)
 
         y = torch.stack(ys, dim=2)  # (batch dim L)
 
@@ -186,14 +198,14 @@ class SSM(torch.nn.Module):
 
 
 class MambaModuleInterp(mamba_ssm.modules.mamba_simple.Mamba):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, max_seq_length = None, **kwargs):
         super().__init__(*args, **kwargs)
 
         self.dt = WrapperModule()
         self.B = WrapperModule()
         self.C = WrapperModule()
 
-        self.ssm = SSM()
+        self.ssm = SSM(max_seq_length)
 
         self.delta_softplus = torch.nn.Softplus()
 
@@ -272,13 +284,12 @@ class MambaModuleInterp(mamba_ssm.modules.mamba_simple.Mamba):
 
 
 class MambaInterp(Mamba):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, max_seq_length = None, **kwargs):
         patcher = Patcher()
-
         patcher.add(
             Patch(
                 mamba_ssm.models.mixer_seq_simple,
-                MambaModuleInterp,
+                partial(MambaModuleInterp, max_seq_length = max_seq_length),
                 "Mamba",
             )
         )
